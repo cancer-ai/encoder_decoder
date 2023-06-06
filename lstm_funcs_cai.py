@@ -1,0 +1,175 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcol
+from torch.utils.data import Dataset
+import collections
+import copy
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import StandardScaler
+from torch.utils.data import DataLoader,TensorDataset
+from MM_LSTM import MM_LSTM_CLASS
+
+# This is a general library of functions used in the other LSTM files
+
+# Resets model weights thru children
+def reset_weights(m):
+        for layer in m.children():
+            if hasattr(layer, 'reset_parameters'):
+                layer.reset_parameters()
+
+def train_model(model, train_dataloader, train_loss, optimizer, device):
+
+    # Puts model in training mode
+    model.train()
+    sum_loss = 0
+
+    # Use first batch to get batch size
+    # batch_size = list(train_dataloader)[0][0].shape[0]
+    # Number of items in dataloader
+    n_batches = len(train_dataloader)
+    c = 0
+    # Iter through dataloader
+    for i in range(0, n_batches):
+        seq,labels = next(iter(train_dataloader))
+
+        # Float the tensors, add CUDA is applicable
+        seq=seq.float().to(device)
+        labels=labels.float().to(device)
+
+        batch_size = len(seq)
+        c += 1
+        # Get num of LSTM layers
+        n_layers = model.num_layers
+
+        # Training loop
+        model.hidden = (torch.zeros(n_layers, batch_size, model.hidden_layer_size).to(device),
+                        torch.zeros(n_layers, batch_size, model.hidden_layer_size).to(device))
+        y_pred = model(seq)
+        single_loss = train_loss(y_pred, labels)
+        optimizer.zero_grad()
+        single_loss.backward()
+        optimizer.step()
+        sum_loss += single_loss.item()
+
+    avg_loss = sum_loss / (c)
+    return avg_loss
+
+def test_model(model, test_inputs, fut_pred, train_window, device):
+    # Testing mode for model
+    model.eval()
+    new_test_inputs = test_inputs.copy()
+
+    # Get model layers
+    n_layers = model.num_layers
+
+    # Predict out by fut_pred timesteps
+    for j in range(fut_pred):
+        # Shaping
+        seq = torch.FloatTensor(new_test_inputs[-train_window:]).to(device)
+        seq = seq.reshape(1,len(seq),len(seq[0]))
+        
+        # Speeds up comp by telling torch to not worry about grads
+        with torch.no_grad():
+            model.hidden = (torch.zeros(n_layers,1,model.hidden_layer_size).to(device),
+                               torch.zeros(n_layers,1,model.hidden_layer_size).to(device))
+            nextstep=model(seq).tolist()
+            new_test_inputs.append(nextstep[0])
+
+    # Return predicted sequence
+    output = new_test_inputs[-fut_pred:]
+    return torch.FloatTensor(output)
+
+# full raining with return of best model state
+def full_train(num_channels, hsize, layers, dropout, batch_size, LR, num_epochs, train_dataloader, test_in, tensor_true_test_data, device):
+    # Print info every 25 epochs
+    print(f'hsize:{hsize}       layers:{layers}       num_epochs:{num_epochs}       dropout:{dropout}      batch_size:{batch_size}       lr:{LR}')
+    
+    test_in_local = copy.deepcopy(test_in)
+
+    # model and optimizer setup
+    model = LSTM_CAI(input_size=num_channels,hidden_layer_size=hsize,num_layers=layers,output_size=num_channels,dropout=dropout,batch_size=batch_size).to(device)
+    model.apply(reset_weights)
+    optimizer = torch.optim.Adam(model.parameters(),lr=LR) #MW - I think there was some discussion of changing the optimization strategy?
+    optimizer.state = collections.defaultdict(dict)
+    fut_pred = len(tensor_true_test_data)
+    best_loss = 9999.9
+
+    # Param inits
+    # Biases are zero, weights are orthogonal
+    for name, param in model.named_parameters():
+        if 'bias' in name:
+            nn.init.constant_(param,0.0)
+            start = int(len(param)/4)
+            end = int(len(param)/2)
+            param.data[start:end].fill_(1.)
+        elif 'weight' in name:
+            nn.init.orthogonal_(param)
+
+    loss_function1 = nn.MSELoss().to(device)
+
+    for i in range(num_epochs):
+        avg_loss = train_model(model, train_dataloader, loss_function1, optimizer, device=device)
+        #Obtain testing loss every 25 epochs and compare to find the best model
+        if i%25 == 1 or i==num_epochs-1:
+
+            ap = test_model(model, test_in_local, fut_pred, train_window=14, device=device).view(-1,num_channels).to(device)
+            test_loss = loss_function1(ap, tensor_true_test_data)
+            print(f'Epoch:{i}       TestLoss1:{test_loss}      TrainLoss:{avg_loss}')
+
+            if test_loss.item() < best_loss and i>300:
+                best_loss = test_loss.item()
+                best_i = i
+                best_ap = ap.detach().clone()
+                model_clone = LSTM_CAI(input_size=num_channels,hidden_layer_size=hsize,num_layers=layers,output_size=num_channels,dropout=dropout,batch_size=batch_size).to(device)
+                model_clone.load_state_dict(copy.deepcopy(model.state_dict()))
+
+    best_prediction = best_ap#.tolist()
+
+    del loss_function1, optimizer, model
+    torch.cuda.empty_cache()
+
+    return best_prediction, best_i, model_clone, best_loss
+
+# This function is used for creating a testing batch for ensemble lossing
+def all_loss_train(num_channels, hsize, layers, dropout, batch_size, LR, num_epochs, train_dataloader, test_in, tensor_true_test_data, device, return_best=False):
+    print(f'hsize:{hsize}       layers:{layers}       num_epochs:{num_epochs}       dropout:{dropout}      batch_size:{batch_size}       lr:{LR}')
+    test_in_local = copy.deepcopy(test_in)
+
+    # model and optimizer setup
+    model = CAI_LSTM(input_size=num_channels,hidden_layer_size=hsize,num_layers=layers,output_size=num_channels,dropout=dropout,batch_size=batch_size).to(device)
+    model.apply(reset_weights)
+    optimizer = torch.optim.Adam(model.parameters(),lr=LR)
+    optimizer.state = collections.defaultdict(dict)
+    fut_pred = len(tensor_true_test_data)
+
+    # Param inits
+    # Biases are zero, weights are orthogonal
+    for name, param in model.named_parameters():
+        if 'bias' in name:
+            nn.init.constant_(param,0.0)
+            start = int(len(param)/4)
+            end = int(len(param)/2)
+            param.data[start:end].fill_(1.)
+        elif 'weight' in name:
+            nn.init.orthogonal_(param)
+
+    loss_function1 = nn.MSELoss().to(device)
+    all_test_loss = []
+    for i in range(num_epochs):
+        avg_loss = train_model(model, train_dataloader, loss_function1, optimizer, device=device)
+        if i%25 == 1:
+            ap = test_model(model, test_in_local, fut_pred, train_window=14, device=device).view(-1,num_channels).to(device)
+            test_loss = loss_function1(ap, tensor_true_test_data)
+            all_test_loss.append((i, test_loss.item()))
+
+    del loss_function1, optimizer, model
+    torch.cuda.empty_cache()
+    if return_best:
+        all_test_loss.sort(key=lambda x:x[1])
+        return all_test_loss[0]
+    else:
+        return all_test_loss
+
