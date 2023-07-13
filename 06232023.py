@@ -26,7 +26,7 @@ filename =  "/project/mayocancerai/GenSLM/Embedding_output.txt"
 
 with open(filename) as f:
     lines = f.readlines()
-    
+    print(len(lines))
     all_embeddings = []
     for line in lines:
         embedding = [] 
@@ -51,4 +51,4 @@ for i in range(epochs):
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
-  
+ 
